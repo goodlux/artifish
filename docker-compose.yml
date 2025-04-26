@@ -1,0 +1,52 @@
+version: '3'
+
+services:
+  memgraph:
+    image: memgraph/memgraph-mage:latest
+    container_name: artifish-memgraph
+    ports:
+      - "7687:7687"
+      - "7444:7444"
+    environment:
+      - MEMGRAPH_TELEMETRY_ENABLED=false
+    volumes:
+      - artifish_mg_lib:/var/lib/memgraph
+      - artifish_mg_log:/var/log/memgraph
+      - artifish_mg_etc:/etc/memgraph
+    command: ["--log-level=TRACE", "--schema-info-enabled=true"]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "echo",
+          "RETURN 1;",
+          "|",
+          "mgconsole",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "7687",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  lab:
+    image: memgraph/lab:latest
+    container_name: artifish-memgraph-lab
+    ports:
+      - "3000:3000"
+    depends_on:
+      memgraph:
+        condition: service_healthy
+    environment:
+      - QUICK_CONNECT_MG_HOST=memgraph
+      - QUICK_CONNECT_MG_PORT=7687
+
+volumes:
+  artifish_mg_lib:
+    name: artifish_mg_lib
+  artifish_mg_log:
+    name: artifish_mg_log
+  artifish_mg_etc:
+    name: artifish_mg_etc

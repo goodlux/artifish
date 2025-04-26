@@ -1,31 +1,30 @@
 """
-Bluesky Network Traversal Worker
+Bluesky Network Traversal Worker with Database Queue
 
-This worker crawls the Bluesky social graph, discovering users and their connections.
+This worker crawls the Bluesky social graph using a database-backed queue system.
 It populates the database with account information, follows, and followers.
 
 Features:
-- Incremental exploration starting from seed accounts
-- Detection of new follows and unfollows
+- Database-backed queue for exploration with priorities
+- Efficient follow/unfollow detection using stored procedures
 - Rate limiting to avoid API restrictions
-- Prioritization of accounts for exploration
+- Prioritization of accounts based on connectivity
 """
 
 import asyncio
 import logging
 import time
-from datetime import datetime, timedelta
 import os
-from typing import List, Dict, Any, Optional, Set
-from dotenv import load_dotenv  # Added dotenv import
+from datetime import datetime
+import random
+from typing import List, Dict, Any, Optional, Set, Tuple
+from dotenv import load_dotenv
 from supabase import create_client, Client
 import argparse
-import json
 import aiohttp
-import random
 
 # Load environment variables from .env file
-load_dotenv()  # Added this line to load .env file
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(
@@ -37,6 +36,7 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("NetworkTraversal")
+
 
 class BlueskyAPIClient:
     """Client for interacting with the Bluesky API."""
@@ -50,6 +50,8 @@ class BlueskyAPIClient:
         self.password = password
         self.rate_limit_remaining = 100
         self.rate_limit_reset = 0
+        self.token_created_at = None
+        self.token_expires_in = 3600  # Default token lifetime in seconds (1 hour)
     
     async def initialize(self):
         """Initialize the API client session and authenticate if credentials are provided."""
@@ -65,6 +67,18 @@ class BlueskyAPIClient:
         if self.session:
             await self.session.close()
             self.session = None
+            
+    def is_token_expired(self):
+        """Check if the authentication token is expired or close to expiring."""
+        if not self.auth_token or not self.token_created_at:
+            return True
+            
+        # Consider token expired if it's within 5 minutes of expiration
+        buffer_time = 300  # 5 minutes in seconds
+        current_time = time.time()
+        expiry_time = self.token_created_at + self.token_expires_in - buffer_time
+        
+        return current_time >= expiry_time
     
     async def get_profile(self, handle: str) -> Optional[Dict[str, Any]]:
         """Get a user's profile information."""
@@ -193,14 +207,27 @@ class BlueskyAPIClient:
                 if response.status == 200:
                     result = await response.json()
                     self.auth_token = result.get("accessJwt")
-                    logger.info(f"Successfully authenticated as {self.username}")
+                    self.token_created_at = time.time()
+                    
+                    # Extract token expiry if available, or use default (1 hour)
+                    # Note: Bluesky tokens typically last for 2 weeks, but we'll refresh more frequently
+                    refresh_in = "1 hour"  # Human-readable for logging
+                    self.token_expires_in = 3600  # 1 hour in seconds
+                    
+                    logger.info(f"Successfully authenticated as {self.username} (token refreshes in {refresh_in})")
                 else:
                     logger.error(f"Authentication failed: {await response.text()}")
         except Exception as e:
             logger.error(f"Error during authentication: {str(e)}")
     
     async def _check_rate_limit(self):
-        """Check and respect rate limits."""
+        """Check and respect rate limits and token expiration."""
+        # First check if token needs to be refreshed
+        if self.username and self.password and self.is_token_expired():
+            logger.info("Auth token is expired or will expire soon, refreshing...")
+            await self._authenticate()
+            
+        # Then check rate limits
         if self.rate_limit_remaining < 10:
             delay = max(0, self.rate_limit_reset - time.time())
             if delay > 0:
@@ -220,123 +247,203 @@ class BlueskyAPIClient:
 
 
 class NetworkTraversal:
-    """Worker for traversing the Bluesky social network."""
+    """Worker for traversing the Bluesky social network using database queue."""
     
     def __init__(self, supabase_url: str, supabase_key: str, pds_host: str = "bsky.social", 
                  bsky_username: str = None, bsky_password: str = None):
         self.supabase: Client = create_client(supabase_url, supabase_key)
         self.api_client = BlueskyAPIClient(pds_host, username=bsky_username, password=bsky_password)
-        self.processed_accounts: Set[str] = set()
-        self.exploration_queue: List[str] = []
         self.exploration_delay = 2.0  # seconds between API calls
         
-    async def start(self, seed_handles: List[str] = None, max_accounts: int = 1000):
-        """Start the network traversal process."""
-        logger.info("Starting network traversal")
+    async def start(self, seed_handles: List[str] = None, max_accounts: int = 1000, min_interval_days: int = 7):
+        """Start the network traversal process using database queue."""
+        logger.info("Starting network traversal with database queue")
         
-        # Get seed accounts
-        if not seed_handles:
-            seed_handles = await self._get_seed_accounts()
-        
-        if not seed_handles:
-            logger.error("No seed accounts available, exiting")
-            return
-        
-        # Add seed accounts to queue
-        self.exploration_queue.extend(seed_handles)
+        # Initialize the queue with seed accounts if provided
+        if seed_handles:
+            await self._add_seed_accounts(seed_handles)
         
         try:
             count = 0
-            # Process queue until empty or max_accounts reached
-            while self.exploration_queue and count < max_accounts:
-                handle = self.exploration_queue.pop(0)
+            total_processed = 0
+            batch_size = min(10, max_accounts)
+            
+            # Main processing loop
+            while total_processed < max_accounts:
+                # Get next batch of accounts to process from the database queue
+                accounts = await self._get_next_accounts(batch_size, min_interval_days)
                 
-                # Skip if already processed
-                if handle in self.processed_accounts:
-                    continue
+                if not accounts:
+                    logger.info("No more accounts to process in queue, adding recommended accounts")
+                    # Try to add some recommended accounts to the queue
+                    added = await self._add_recommended_accounts()
+                    if added:
+                        continue
+                    else:
+                        logger.info("No more accounts available, finishing")
+                        break
                 
-                # Process the account
-                await self._process_account(handle)
-                self.processed_accounts.add(handle)
-                count += 1
+                # Process each account in the batch
+                for account in accounts:
+                    # Process the account
+                    await self._process_account(account['did'], account['handle'])
+                    count += 1
+                    total_processed += 1
+                    
+                    # Add some randomized delay to avoid rate limiting
+                    delay = self.exploration_delay * (0.8 + 0.4 * random.random())
+                    await asyncio.sleep(delay)
                 
-                # Add some randomized delay to avoid rate limiting
-                delay = self.exploration_delay * (0.8 + 0.4 * random.random())
-                await asyncio.sleep(delay)
+                logger.info(f"Processed batch of {count} accounts, total: {total_processed}/{max_accounts}")
+                count = 0
                 
-                if count % 10 == 0:
-                    logger.info(f"Processed {count} accounts, queue size: {len(self.exploration_queue)}")
+                # Update priorities periodically
+                if total_processed % 50 == 0:
+                    await self._update_account_priorities()
         
         finally:
             await self.api_client.close()
-            logger.info(f"Network traversal completed. Processed {len(self.processed_accounts)} accounts")
+            logger.info(f"Network traversal completed. Processed {total_processed} accounts")
     
-    async def _get_seed_accounts(self) -> List[str]:
-        """Get seed accounts from the database."""
+    async def _get_next_accounts(self, limit: int, min_interval_days: int) -> List[Dict]:
+        """Get next batch of accounts to process from database queue."""
         try:
-            # Try to get accounts that haven't been updated recently
-            check_date = (datetime.now() - timedelta(days=7)).isoformat()
-            result = self.supabase.table('bluesky_accounts') \
-                          .select('handle') \
-                          .or_(f"follows_last_updated_at.is.null,follows_last_updated_at.lt.{check_date}") \
-                          .limit(10) \
-                          .execute()
+            result = self.supabase.rpc(
+                'get_accounts_to_crawl', 
+                {'limit_count': limit, 'min_interval': f'{min_interval_days} days'}
+            ).execute()
             
-            handles = [account['handle'] for account in result.data]
-            
-            # If no accounts need updating, get any accounts
-            if not handles:
-                result = self.supabase.table('bluesky_accounts') \
-                              .select('handle') \
-                              .limit(10) \
-                              .execute()
-                handles = [account['handle'] for account in result.data]
-            
-            # If still no accounts, use a default
-            if not handles:
-                handles = ["boss-c.art.ifi.sh"]
-            
-            return handles
+            return result.data
             
         except Exception as e:
-            logger.error(f"Error getting seed accounts: {e}")
-            return ["boss-c.art.ifi.sh"]  # Default fallback
+            logger.error(f"Error getting next accounts from queue: {e}")
+            return []
     
-    async def _process_account(self, handle: str):
+    async def _add_seed_accounts(self, handles: List[str]):
+        """Add seed accounts to the database."""
+        for handle in handles:
+            try:
+                # Ensure handle is in the correct format
+                if '.' not in handle:
+                    logger.warning(f"Invalid handle format for {handle}, skipping")
+                    continue
+                    
+                # Get profile
+                profile = await self.api_client.get_profile(handle)
+                if not profile:
+                    logger.warning(f"Could not fetch profile for seed account {handle}")
+                    continue
+                
+                # Store or update user with high priority
+                did = profile.get("did")
+                if did:
+                    self._store_user(did, handle, profile)
+                    
+                    # Set high priority
+                    self.supabase.table('bluesky_accounts').update({
+                        "crawl_priority": 100,
+                        "crawl_status": "pending"
+                    }).eq('did', did).execute()
+                    
+                    logger.info(f"Added seed account {handle} ({did}) to queue with high priority")
+                    
+            except Exception as e:
+                logger.error(f"Error adding seed account {handle}: {e}")
+    
+    async def _add_recommended_accounts(self) -> bool:
+        """Add recommended accounts to the queue based on network connectivity."""
+        try:
+            result = self.supabase.rpc(
+                'get_recommended_accounts', 
+                {'limit_count': 20, 'max_priority': 80}
+            ).execute()
+            
+            if not result.data:
+                return False
+                
+            # Update these accounts to be pending with higher priority
+            for account in result.data:
+                self.supabase.table('bluesky_accounts').update({
+                    "crawl_status": "pending",
+                    "crawl_priority": 70  # Set a good priority but not as high as seed accounts
+                }).eq('did', account['did']).execute()
+                
+            logger.info(f"Added {len(result.data)} recommended accounts to queue")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error adding recommended accounts: {e}")
+            return False
+    
+    async def _update_account_priorities(self):
+        """Update account priorities based on connectivity."""
+        try:
+            self.supabase.rpc('update_crawl_priorities').execute()
+            logger.info("Updated account crawl priorities")
+        except Exception as e:
+            logger.error(f"Error updating account priorities: {e}")
+    
+    async def _process_account(self, did: str, handle: str):
         """Process a single account - get profile, follows, followers."""
-        logger.info(f"Processing account: {handle}")
+        logger.info(f"Processing account: {handle} ({did})")
         
         try:
             # Get profile
             profile = await self.api_client.get_profile(handle)
             if not profile:
                 logger.warning(f"Could not fetch profile for {handle}")
+                # Mark as failed
+                self.supabase.rpc('mark_account_crawled', {
+                    'account_did': did, 
+                    'status': 'failed'
+                }).execute()
                 return
+                
+            # If we reach this point after token expiration, we've successfully refreshed the token
             
             # Store or update user
-            did = profile.get("did")
-            if did:
-                self._store_user(did, handle, profile)
+            self._store_user(did, handle, profile)
                 
-                # Process follows
-                await self._process_follows(did)
-                
-                # Process followers
-                await self._process_followers(did)
-                
-                # Update the follows_last_updated_at timestamp
-                self._update_follows_timestamp(did)
-                
-                # Add some accounts to the exploration queue
-                self._add_accounts_to_queue()
-        
+            # Process follows
+            follows_dids = await self._collect_all_follows(did)
+            
+            # Process followers with lower probability
+            if random.random() < 0.5:  # 50% chance to process followers
+                await self._collect_some_followers(did)
+            
+            # Use stored procedure to efficiently process follows
+            result = self.supabase.rpc('process_account_follows', {
+                'account_did': did,
+                'current_follows': follows_dids
+            }).execute()
+            
+            if result.data:
+                stats = result.data[0]
+                logger.info(f"Follows for {handle}: {stats['new_follows_count']} new, "
+                           f"{stats['maintained_follows_count']} maintained, "
+                           f"{stats['unfollowed_count']} unfollowed")
+            
+            # Mark account as processed
+            self.supabase.rpc('mark_account_crawled', {
+                'account_did': did,
+                'status': 'completed'
+            }).execute()
+            
         except Exception as e:
-            logger.error(f"Error processing account {handle}: {e}")
+            logger.error(f"Error processing account {handle} ({did}): {e}")
+            # Mark as error
+            try:
+                self.supabase.rpc('mark_account_crawled', {
+                    'account_did': did, 
+                    'status': 'error'
+                }).execute()
+            except:
+                pass
     
-    async def _process_follows(self, did: str):
-        """Process all accounts that a user follows."""
+    async def _collect_all_follows(self, did: str) -> List[str]:
+        """Collect all DIDs that a user follows."""
+        follows_dids = []
         cursor = None
-        follows_count = 0
         
         while True:
             follows_data = await self.api_client.get_follows(did, limit=100, cursor=cursor)
@@ -345,7 +452,7 @@ class NetworkTraversal:
             if not follows:
                 break
             
-            # Process each follow
+            # Collect DIDs of followed accounts
             for follow in follows:
                 following_did = follow.get("did")
                 following_handle = follow.get("handle")
@@ -353,15 +460,7 @@ class NetworkTraversal:
                 if following_did and following_handle:
                     # Store the user
                     self._store_user(following_did, following_handle, follow)
-                    
-                    # Store the follow relationship
-                    self._store_follow(did, following_did)
-                    
-                    # Add to exploration queue with low probability
-                    if random.random() < 0.1:  # 10% chance
-                        self.exploration_queue.append(following_handle)
-                
-                follows_count += 1
+                    follows_dids.append(following_did)
             
             # Check if there are more follows
             cursor = follows_data.get("cursor")
@@ -371,14 +470,16 @@ class NetworkTraversal:
             # Add delay between paginated requests
             await asyncio.sleep(self.exploration_delay)
         
-        logger.info(f"Processed {follows_count} follows for {did}")
+        logger.info(f"Collected {len(follows_dids)} follows for {did}")
+        return follows_dids
     
-    async def _process_followers(self, did: str):
-        """Process accounts that follow a user."""
+    async def _collect_some_followers(self, did: str, max_pages: int = 3) -> None:
+        """Collect some followers of a user (limited to save API calls)."""
         cursor = None
         followers_count = 0
+        pages = 0
         
-        while True:
+        while pages < max_pages:
             followers_data = await self.api_client.get_followers(did, limit=100, cursor=cursor)
             followers = followers_data.get("followers", [])
             
@@ -394,12 +495,12 @@ class NetworkTraversal:
                     # Store the user
                     self._store_user(follower_did, follower_handle, follower)
                     
-                    # Store the follow relationship (follower follows did)
-                    self._store_follow(follower_did, did)
-                    
-                    # Add to exploration queue with low probability
-                    if random.random() < 0.05:  # 5% chance
-                        self.exploration_queue.append(follower_handle)
+                    # Add to queue with lower priority 
+                    if random.random() < 0.2:  # 20% chance
+                        self.supabase.table('bluesky_accounts').update({
+                            "crawl_priority": 50,
+                            "crawl_status": "pending"
+                        }).eq('did', follower_did).execute()
                 
                 followers_count += 1
             
@@ -410,8 +511,9 @@ class NetworkTraversal:
                 
             # Add delay between paginated requests
             await asyncio.sleep(self.exploration_delay)
+            pages += 1
         
-        logger.info(f"Processed {followers_count} followers for {did}")
+        logger.info(f"Collected {followers_count} followers for {did} (limited to {max_pages} pages)")
     
     def _store_user(self, did: str, handle: str, profile_data: Dict[str, Any]):
         """Store or update a user in the database."""
@@ -441,81 +543,29 @@ class NetworkTraversal:
                 user_data["bio"] = description
             if avatar_url:
                 user_data["avatar_url"] = avatar_url
+            
+            try:
+                # Try update first
+                update_result = self.supabase.table('bluesky_accounts').update(user_data).eq('did', did).execute()
                 
-            # Upsert into database
-            self.supabase.table('bluesky_accounts').upsert(user_data).execute()
+                # If no rows updated, insert it
+                if not update_result.data or len(update_result.data) == 0:
+                    insert_result = self.supabase.table('bluesky_accounts').insert(user_data).execute()
+                    logger.info(f"Created new account record for {handle}")
+            except Exception as supabase_error:
+                # If update/insert approach fails, fall back to upsert
+                logger.warning(f"Error with update/insert for {handle}, falling back to upsert: {supabase_error}")
+                self.supabase.table('bluesky_accounts').upsert(user_data).execute()
             
         except Exception as e:
             logger.error(f"Error storing user {handle} ({did}): {e}")
-    
-    def _store_follow(self, follower_did: str, following_did: str):
-        """Store a follow relationship in the database."""
-        try:
-            # Check if follow relationship already exists
-            result = self.supabase.table('follows') \
-                          .select('id') \
-                          .eq('follower_did', follower_did) \
-                          .eq('following_did', following_did) \
-                          .execute()
-            
-            now = datetime.now().isoformat()
-            
-            if not result.data:
-                # Insert new follow relationship
-                follow_data = {
-                    "follower_did": follower_did,
-                    "following_did": following_did,
-                    "created_at": now,
-                    "last_verified_at": now
-                }
-                self.supabase.table('follows').insert(follow_data).execute()
-            else:
-                # Update existing follow relationship
-                follow_id = result.data[0]['id']
-                self.supabase.table('follows') \
-                          .update({"last_verified_at": now}) \
-                          .eq('id', follow_id) \
-                          .execute()
-                          
-        except Exception as e:
-            logger.error(f"Error storing follow relationship {follower_did} -> {following_did}: {e}")
-    
-    def _update_follows_timestamp(self, did: str):
-        """Update the follows_last_updated_at timestamp for an account."""
-        try:
-            self.supabase.table('bluesky_accounts') \
-                      .update({"follows_last_updated_at": datetime.now().isoformat()}) \
-                      .eq('did', did) \
-                      .execute()
-        except Exception as e:
-            logger.error(f"Error updating follows_last_updated_at for {did}: {e}")
-    
-    def _add_accounts_to_queue(self):
-        """Add more accounts to the exploration queue to ensure continued exploration."""
-        # If queue is getting short, add more accounts
-        if len(self.exploration_queue) < 10:
-            try:
-                # Get some random accounts we haven't processed yet
-                # Use a simple order by id instead of random()
-                result = self.supabase.table('bluesky_accounts') \
-                              .select('handle') \
-                              .order('id', desc=False) \
-                              .limit(20) \
-                              .execute()
-                
-                for account in result.data:
-                    handle = account.get('handle')
-                    if handle and handle not in self.processed_accounts and handle not in self.exploration_queue:
-                        self.exploration_queue.append(handle)
-                        
-            except Exception as e:
-                logger.error(f"Error adding accounts to queue: {e}")
 
 
 async def main():
-    parser = argparse.ArgumentParser(description='Bluesky Network Traversal Worker')
+    parser = argparse.ArgumentParser(description='Bluesky Network Traversal Worker (DB Queue)')
     parser.add_argument('--seed', type=str, help='Comma-separated list of seed handles')
     parser.add_argument('--max', type=int, default=100, help='Maximum number of accounts to process')
+    parser.add_argument('--interval', type=int, default=7, help='Minimum interval in days before recrawling')
     parser.add_argument('--delay', type=float, default=2.0, help='Delay between API calls in seconds')
     args = parser.parse_args()
     
@@ -546,7 +596,11 @@ async def main():
         seed_handles = [handle.strip() for handle in args.seed.split(',')]
     
     # Start traversal
-    await traversal.start(seed_handles=seed_handles, max_accounts=args.max)
+    await traversal.start(
+        seed_handles=seed_handles, 
+        max_accounts=args.max,
+        min_interval_days=args.interval
+    )
 
 
 if __name__ == "__main__":
