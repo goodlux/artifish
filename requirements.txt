@@ -1,6 +1,6 @@
 # Core dependencies
-google-adk
 python-dotenv>=1.0.0
+certifi>=2024.2.2  # For SSL certificate verification
 
 # Database
 supabase>=0.7.1
@@ -20,9 +20,6 @@ scikit-learn>=1.2.2  # For basic topic modeling
 pydantic>=2.0.0
 python-dateutil>=2.8.2
 tqdm>=4.65.0  # For progress bars
-
-# Async
-asyncio>=3.4.3
 
 # Logging
 structlog>=23.1.0

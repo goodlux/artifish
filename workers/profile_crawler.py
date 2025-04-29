@@ -1,20 +1,23 @@
 """
-Bluesky Network Traversal Worker with Database Queue
+Bluesky Profile Crawler with Database Queue
 
 This worker crawls the Bluesky social graph using a database-backed queue system.
-It populates the database with account information, follows, and followers.
+It populates the database with account profiles, follows, and followers information.
 
 Features:
-- Database-backed queue for exploration with priorities
+- Database-backed queue for profile exploration with priorities
 - Efficient follow/unfollow detection using stored procedures
 - Rate limiting to avoid API restrictions
 - Prioritization of accounts based on connectivity
+- SSL certificate verification for secure API connections
 """
 
 import asyncio
 import logging
 import time
 import os
+import ssl
+import certifi
 from datetime import datetime
 import random
 from typing import List, Dict, Any, Optional, Set, Tuple
@@ -31,11 +34,11 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("network_traversal.log"),
+        logging.FileHandler("profile_crawler.log"),
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger("NetworkTraversal")
+logger = logging.getLogger("ProfileCrawler")
 
 
 class BlueskyAPIClient:
@@ -56,7 +59,11 @@ class BlueskyAPIClient:
     async def initialize(self):
         """Initialize the API client session and authenticate if credentials are provided."""
         if self.session is None:
-            self.session = aiohttp.ClientSession()
+            # Create an SSL context using certifi's trusted certificates
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            # Create a ClientSession with the SSL context
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            self.session = aiohttp.ClientSession(connector=connector)
             
         # Authenticate if credentials are provided and not already authenticated
         if self.username and self.password and not self.auth_token:
@@ -246,7 +253,7 @@ class BlueskyAPIClient:
             self.rate_limit_reset = time.time() + 60
 
 
-class NetworkTraversal:
+class ProfileCrawler:
     """Worker for traversing the Bluesky social network using database queue."""
     
     def __init__(self, supabase_url: str, supabase_key: str, pds_host: str = "bsky.social", 
@@ -257,7 +264,7 @@ class NetworkTraversal:
         
     async def start(self, seed_handles: List[str] = None, max_accounts: int = 1000, min_interval_days: int = 7):
         """Start the network traversal process using database queue."""
-        logger.info("Starting network traversal with database queue")
+        logger.info("Starting profile crawler with database queue")
         
         # Initialize the queue with seed accounts if provided
         if seed_handles:
@@ -303,7 +310,7 @@ class NetworkTraversal:
         
         finally:
             await self.api_client.close()
-            logger.info(f"Network traversal completed. Processed {total_processed} accounts")
+            logger.info(f"Profile crawler completed. Processed {total_processed} accounts")
     
     async def _get_next_accounts(self, limit: int, min_interval_days: int) -> List[Dict]:
         """Get next batch of accounts to process from database queue."""
@@ -378,10 +385,12 @@ class NetworkTraversal:
     async def _update_account_priorities(self):
         """Update account priorities based on connectivity."""
         try:
-            self.supabase.rpc('update_crawl_priorities').execute()
+            # Add timeout parameter to prevent long-running queries
+            self.supabase.rpc('update_crawl_priorities', params={}, timeout=30).execute()
             logger.info("Updated account crawl priorities")
         except Exception as e:
             logger.error(f"Error updating account priorities: {e}")
+            logger.info("Continuing despite priority update error - will try again later")
     
     async def _process_account(self, did: str, handle: str):
         """Process a single account - get profile, follows, followers."""
@@ -529,6 +538,38 @@ class NetworkTraversal:
             elif "avatar" in profile_data.get("profile", {}):
                 avatar_url = profile_data.get("profile", {}).get("avatar")
                 
+            # Extract the new fields
+            posts_count = None
+            followers_count = None
+            follows_count = None
+            pinned_post = None
+            
+            # Try to get counts from different response formats
+            if "postsCount" in profile_data:
+                posts_count = profile_data.get("postsCount")
+            elif "postsCount" in profile_data.get("profile", {}):
+                posts_count = profile_data.get("profile", {}).get("postsCount")
+                
+            if "followersCount" in profile_data:
+                followers_count = profile_data.get("followersCount")
+            elif "followersCount" in profile_data.get("profile", {}):
+                followers_count = profile_data.get("profile", {}).get("followersCount")
+                
+            if "followsCount" in profile_data:
+                follows_count = profile_data.get("followsCount")
+            elif "followsCount" in profile_data.get("profile", {}):
+                follows_count = profile_data.get("profile", {}).get("followsCount")
+                
+            # Extract pinned post if available
+            if "pinnedPost" in profile_data:
+                pinned_post_data = profile_data.get("pinnedPost")
+                if pinned_post_data and "uri" in pinned_post_data:
+                    pinned_post = pinned_post_data.get("uri")
+            elif "pinnedPost" in profile_data.get("profile", {}):
+                pinned_post_data = profile_data.get("profile", {}).get("pinnedPost")
+                if pinned_post_data and "uri" in pinned_post_data:
+                    pinned_post = pinned_post_data.get("uri")
+                
             # Prepare user data
             user_data = {
                 "did": did,
@@ -544,6 +585,16 @@ class NetworkTraversal:
             if avatar_url:
                 user_data["avatar_url"] = avatar_url
             
+            # Add new fields if available
+            if posts_count is not None:
+                user_data["posts_count"] = posts_count
+            if followers_count is not None:
+                user_data["followers_count"] = followers_count
+            if follows_count is not None:
+                user_data["follows_count"] = follows_count
+            if pinned_post:
+                user_data["pinned_post"] = pinned_post
+            
             try:
                 # Try update first
                 update_result = self.supabase.table('bluesky_accounts').update(user_data).eq('did', did).execute()
@@ -557,6 +608,12 @@ class NetworkTraversal:
                 logger.warning(f"Error with update/insert for {handle}, falling back to upsert: {supabase_error}")
                 self.supabase.table('bluesky_accounts').upsert(user_data).execute()
             
+            # Log when new fields are captured
+            if any(field is not None for field in [posts_count, followers_count, follows_count, pinned_post]):
+                logger.info(f"Captured additional profile data for {handle}: posts={posts_count}, "
+                           f"followers={followers_count}, follows={follows_count}, "
+                           f"has_pinned_post={pinned_post is not None}")
+            
         except Exception as e:
             logger.error(f"Error storing user {handle} ({did}): {e}")
 
@@ -567,6 +624,7 @@ async def main():
     parser.add_argument('--max', type=int, default=100, help='Maximum number of accounts to process')
     parser.add_argument('--interval', type=int, default=7, help='Minimum interval in days before recrawling')
     parser.add_argument('--delay', type=float, default=2.0, help='Delay between API calls in seconds')
+    parser.add_argument('--retries', type=int, default=3, help='Number of retries for connection failures')
     args = parser.parse_args()
     
     # Get configuration from environment or use defaults
@@ -581,26 +639,52 @@ async def main():
     bsky_username = os.environ.get('BSKY_USERNAME')
     bsky_password = os.environ.get('BSKY_PASSWORD')
     
-    # Initialize traversal
-    traversal = NetworkTraversal(
+    if not bsky_username or not bsky_password:
+        logger.warning("BSKY_USERNAME and BSKY_PASSWORD not set. Some API operations may be limited.")
+    
+    # Log SSL certificate information
+    logger.info(f"Using SSL certificates from: {certifi.where()}")
+    
+    # Initialize crawler
+    crawler = ProfileCrawler(
         supabase_url, 
         supabase_key, 
         bsky_username=bsky_username, 
         bsky_password=bsky_password
     )
-    traversal.exploration_delay = args.delay
+    crawler.exploration_delay = args.delay
     
     # Parse seed handles if provided
     seed_handles = None
     if args.seed:
         seed_handles = [handle.strip() for handle in args.seed.split(',')]
     
-    # Start traversal
-    await traversal.start(
-        seed_handles=seed_handles, 
-        max_accounts=args.max,
-        min_interval_days=args.interval
-    )
+    # Start traversal with retry loop
+    retry_count = 0
+    while retry_count <= args.retries:
+        try:
+            logger.info(f"Starting profile crawler (attempt {retry_count + 1}/{args.retries + 1})")
+            await crawler.start(
+                seed_handles=seed_handles, 
+                max_accounts=args.max,
+                min_interval_days=args.interval
+            )
+            # If we get here, the traversal was successful
+            break
+        except aiohttp.ClientConnectorError as e:
+            logger.error(f"Connection error: {e}")
+            retry_count += 1
+            if retry_count <= args.retries:
+                wait_time = 5 * retry_count  # Incremental backoff
+                logger.info(f"Retrying in {wait_time} seconds...")
+                await asyncio.sleep(wait_time)
+            else:
+                logger.error(f"Maximum retry attempts ({args.retries}) reached. Giving up.")
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+            raise  # Re-raise unexpected exceptions
+    
+    logger.info("Profile crawler completed")
 
 
 if __name__ == "__main__":
