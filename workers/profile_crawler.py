@@ -262,7 +262,7 @@ class ProfileCrawler:
         self.api_client = BlueskyAPIClient(pds_host, username=bsky_username, password=bsky_password)
         self.exploration_delay = 2.0  # seconds between API calls
         
-    async def start(self, seed_handles: List[str] = None, max_accounts: int = 1000, min_interval_days: int = 7):
+    async def start(self, seed_handles: List[str] = None, max_accounts: int = 50000, min_interval_days: int = 7, continuous: bool = False, duration: int = None):
         """Start the network traversal process using database queue."""
         logger.info("Starting profile crawler with database queue")
         
@@ -273,10 +273,19 @@ class ProfileCrawler:
         try:
             count = 0
             total_processed = 0
-            batch_size = min(10, max_accounts)
+            batch_size = 10
+            start_time = time.time()
             
             # Main processing loop
-            while total_processed < max_accounts:
+            while True:
+                # Check stopping conditions
+                if not continuous and total_processed >= max_accounts:
+                    logger.info(f"Reached max accounts limit: {max_accounts}")
+                    break
+                    
+                if duration and (time.time() - start_time) >= duration:
+                    logger.info(f"Reached time limit: {duration} seconds")
+                    break
                 # Get next batch of accounts to process from the database queue
                 accounts = await self._get_next_accounts(batch_size, min_interval_days)
                 
@@ -621,7 +630,9 @@ class ProfileCrawler:
 async def main():
     parser = argparse.ArgumentParser(description='Bluesky Network Traversal Worker (DB Queue)')
     parser.add_argument('--seed', type=str, help='Comma-separated list of seed handles')
-    parser.add_argument('--max', type=int, default=100, help='Maximum number of accounts to process')
+    parser.add_argument('--max', type=int, default=50000, help='Maximum number of accounts to process (default: 50000)')
+    parser.add_argument('--continuous', action='store_true', help='Run continuously without limit')
+    parser.add_argument('--duration', type=int, help='Run for specified duration in seconds')
     parser.add_argument('--interval', type=int, default=7, help='Minimum interval in days before recrawling')
     parser.add_argument('--delay', type=float, default=2.0, help='Delay between API calls in seconds')
     parser.add_argument('--retries', type=int, default=3, help='Number of retries for connection failures')
@@ -665,9 +676,11 @@ async def main():
         try:
             logger.info(f"Starting profile crawler (attempt {retry_count + 1}/{args.retries + 1})")
             await crawler.start(
-                seed_handles=seed_handles, 
+                seed_handles=seed_handles,
                 max_accounts=args.max,
-                min_interval_days=args.interval
+                min_interval_days=args.interval,
+                continuous=args.continuous,
+                duration=args.duration
             )
             # If we get here, the traversal was successful
             break

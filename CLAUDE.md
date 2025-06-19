@@ -3,11 +3,11 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Commands
-- Setup: `./setup.sh` to create venv and install dependencies
-- Run: `python -m artifish.agent` to run the main agent
-- Tests: `pytest` or `pytest tests/specific_test.py` for single test
-- Format: `black .` for code formatting
-- Type check: `mypy artifish/`
+- Setup: `./setup_uv.sh` to create venv and install dependencies with uv
+- Run: `uv run artifish` or `python -m artifish.agent` to run the main agent
+- Tests: `uv run pytest` or `pytest tests/specific_test.py` for single test
+- Format: `uv run black .` for code formatting
+- Type check: `uv run mypy artifish/`
 
 ## Coding Guidelines
 - **Style**: PEP 8 compliant, 4-space indentation
